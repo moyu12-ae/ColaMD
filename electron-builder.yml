@@ -75,8 +75,15 @@ mac:
   notarize: true
 
 win:
+  # Artifact names must stay distinct from the mac ones: the mac zips are
+  # ColaMD-<version>-<arch>.zip, so a plain win zip would collide with the mac
+  # x64 zip in the release assets.
+  artifactName: ${productName}-${version}-win-${arch}.${ext}
   target:
     - nsis
+    # Green build: unzip anywhere and run, nothing to install. No file
+    # association, no Start Menu entry and no in-app updates, by design.
+    - zip
   icon: resources/icon.png
 
 linux:

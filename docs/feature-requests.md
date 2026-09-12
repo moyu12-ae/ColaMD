@@ -114,6 +114,8 @@ The reveal button shipped in v2.0.4 and v2.0.5 was unreachable, but not because 
 
 Publish the existing mac zip artifact as a visible download alongside the dmg so the app can run unzipped without installation. The mac side is already published.
 
+**Decision (2026-09-13):** ship the `zip` target on Windows. A folder you unzip and run beats a self-extracting exe for an editor that has to feel immediate on launch, and someone will package it anyway if we do not. Settings stay in `%APPDATA%` like the installed build, so the green build leaves that folder behind; revisit if users ask for a fully self-contained folder.
+
 Windows is the open half, and a Windows user asked again. Two shapes, and they are not equivalent:
 
 - `zip` target: the unpacked app in an archive. Unzip anywhere and run, nothing touches the registry, "uninstall" is deleting the folder, and startup is unchanged. This is the classic green build.
@@ -221,16 +223,6 @@ No decision yet on which AI capabilities belong in the editor, and therefore no 
 
 Fenced code blocks currently render as plain styled text with a copy button, without language-aware colouring. Adding it means shipping a highlighter and deciding which languages to support, so it stays tracked rather than committed. The issue remains open.
 
-### System WebView shell (Tauri) migration
-
-**Sources:** maintainer discussion, 2026-08-29 and 2026-09-13
-
-On macOS, ColaMD ships Chromium with every download. That single framework is 191 MB unpacked, about 75 MB compressed, and it is the entire reason the dmg is around 82 MB while Typora's is around 14 MB: Typora uses the WebView macOS already provides.
-
-Migration to a system-WebView shell would collapse the download to our own code plus a small runtime. It is a rewrite of the main process, not a build flag: window management, menus, file dialogs, watchers, printing, auto-update and signing all get replaced, and rendering moves to WebKit on macOS, WebView2 on Windows and WebKitGTK on Linux. WebKitGTK is the real risk on Linux, because distro coverage and rendering behaviour vary.
-
-Windows is the honest counterweight: Typora's Windows installer is 86 to 108 MB, close to our 115 MB Setup, because there is no dependable system WebView there. So the 14 MB figure is a macOS-only effect, and the migration only pays off on one of three platforms.
-
 ### Footnote hover preview
 
 **Source:** [#25](https://github.com/marswaveai/ColaMD/issues/25)
@@ -242,6 +234,11 @@ Windows is the honest counterweight: Typora's Windows installer is 86 to 108 MB,
 **Constraints:** Build on the existing footnote rendering with a lightweight hover interaction. Do not add a permanent panel.
 
 ## Declined
+
+### System WebView shell (Tauri) migration
+
+**Declined (2026-09-13).** On macOS a system-WebView shell would collapse the download from 82 MB to roughly Typora's 14 MB, because the OS supplies the browser. It does not pay off anywhere else: Typora's own Windows installer is 86 to 108 MB for the same reason ours is 115 MB, there is no dependable system WebView on Windows, and WebKitGTK on Linux carries real distro and rendering risk. A main-process rewrite for one of three platforms is not worth it. Revisit only if ColaMD ever becomes macOS-only.
+
 
 ### Built-in translation
 
