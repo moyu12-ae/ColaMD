@@ -29,6 +29,7 @@ export interface ElectronAPI {
   openFilePath: (path: string) => Promise<{ path: string; content: string } | null>
   getFileManagerName: () => Promise<FileManagerName>
   revealFile: () => Promise<boolean>
+  showEntryContextMenu: (path: string, kind: 'file' | 'directory') => Promise<void>
   listSiblings: () => Promise<SiblingFile[] | null>
   openSibling: (path: string) => Promise<boolean>
   saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean) => Promise<string | null>
@@ -85,6 +86,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFilePath: (path: string) => ipcRenderer.invoke('open-file-path', path),
   getFileManagerName: () => ipcRenderer.invoke('get-file-manager-name') as Promise<FileManagerName>,
   revealFile: () => ipcRenderer.invoke('reveal-file') as Promise<boolean>,
+  showEntryContextMenu: (path: string, kind: 'file' | 'directory') => ipcRenderer.invoke('entry-context-menu', path, kind) as Promise<void>,
   listSiblings: () => ipcRenderer.invoke('list-siblings'),
   openSibling: (path: string) => ipcRenderer.invoke('open-sibling', path),
   saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean) => ipcRenderer.invoke('save-file', content, expectedPath, rebuildMenu),

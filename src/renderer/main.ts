@@ -792,6 +792,16 @@ async function init(): Promise<void> {
 
   fileToggleBtnEl().addEventListener('click', togglePanel)
   revealFileBtnEl().addEventListener('click', () => { void api.revealFile() })
+  // Right-click on a file panel entry opens the native context menu. The
+  // parent entry has no target worth acting on, so it keeps the default.
+  fileListEl().addEventListener('contextmenu', (e) => {
+    const btn = (e.target as HTMLElement).closest('button[data-path]') as HTMLButtonElement | null
+    const path = btn?.dataset.path
+    const kind = btn?.dataset.kind
+    if (!path || kind === 'parent') return
+    e.preventDefault()
+    void api.showEntryContextMenu(path, kind === 'directory' ? 'directory' : 'file')
+  })
   initPanelResize()
   fileTabEl().addEventListener('click', () => setPanelMode('files'))
   outlineTabEl().addEventListener('click', () => setPanelMode('outline'))

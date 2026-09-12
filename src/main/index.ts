@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, shell, session } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, Menu, shell, session, clipboard } from 'electron'
 import { execFile } from 'child_process'
 import { autoUpdater } from 'electron-updater'
 import { join, basename, dirname, extname, isAbsolute, resolve, relative } from 'path'
@@ -561,10 +561,32 @@ ipcMain.on('open-external', (_event, url: string) => {
   }
 })
 
-ipcMain.handle('get-file-manager-name', () => {
+ipcMain.handle('get-file-manager-name', () => fileManagerName())
+
+function fileManagerName(): 'finder' | 'explorer' | 'file-manager' {
   if (process.platform === 'darwin') return 'finder'
   if (process.platform === 'win32') return 'explorer'
   return 'file-manager'
+}
+
+// Right-click menu for a file panel entry. Native menu on purpose: no custom
+// popup to theme, keep it accessible and platform familiar.
+ipcMain.handle('entry-context-menu', (event, targetPath: unknown, kind: unknown) => {
+  const win = getWinFromEvent(event)
+  if (!win || typeof targetPath !== 'string' || targetPath.length === 0) return
+  const zh = getPreferredLanguage() === 'zh'
+  const manager = fileManagerName()
+  const items: Electron.MenuItemConstructorOptions[] = [
+    { label: zh ? '复制路径' : 'Copy path', click: () => clipboard.writeText(targetPath) }
+  ]
+  if (kind !== 'directory') {
+    items.push({ label: zh ? '用默认应用打开' : 'Open in default app', click: () => { void shell.openPath(targetPath) } })
+  }
+  items.push({
+    label: manager === 'explorer' ? (zh ? '在资源管理器中显示' : 'Reveal in File Explorer') : (zh ? '在 Finder 中显示' : 'Reveal in Finder'),
+    click: () => shell.showItemInFolder(targetPath)
+  })
+  Menu.buildFromTemplate(items).popup({ window: win })
 })
 
 ipcMain.handle('reveal-file', (event) => {
