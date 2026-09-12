@@ -2,7 +2,7 @@
 
 ColaMD 的界面设计规范。所有功能、视觉和交互改动都应以本文档为基准；如果新需求与规范冲突，应先更新规范，再实现功能。
 
-> Writing should feel this simple.
+> Writing should be this simple.
 
 ## 1. 设计原则
 
