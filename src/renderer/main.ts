@@ -31,6 +31,11 @@ let dirty = false
 // Programmatic Markdown replacement dispatches a synchronous ProseMirror
 // transaction. Suppress only that transaction, never a time window of input.
 let applyingProgrammaticChange = false
+// The editor emits updates while it is being built: the initial document plus
+// the trailing paragraph it inserts. Those are not user edits, so a document
+// must not start out dirty, or closing an untouched new window would ask to
+// save it.
+let editorReady = false
 // Fresh installs start focused on the document. Once changed, the user's
 // explicit panel preference is preserved.
 let manualHidden = localStorage.getItem('file-panel-hidden') !== '0'
@@ -769,10 +774,13 @@ async function init(): Promise<void> {
   await createEditor('editor', (markdown) => {
     updateWordCount(markdown)
   }, () => {
+    if (!editorReady) return
     if (!applyingProgrammaticChange) setDirty()
     scheduleOutlineUpdate()
   })
   updateWordCount()
+  editorReady = true
+  resetDirty()
 
   // Main asks for an authoritative snapshot before any close or quit.
   api.onRequestDocumentState((requestId) => {
