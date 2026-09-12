@@ -2,6 +2,25 @@
 
 本地打包的实测记录与规矩。结论来自 2026-09-12 的一次本地验证打包（macOS 26.6、arm64、electron-builder 26.16.1）。
 
+## 包体积
+
+按 PR #82 的配置（2026-09-13 合入），本地实测：
+
+| 项 | 之前 | 之后 |
+| --- | --- | --- |
+| app bundle（未压缩） | 408 MB | 215 MB |
+| `app.asar` | 169 MB | 10.7 MB |
+| 每架构 zip（自动更新要下的量） | universal 207 MB | **arm64 85.3 MB / x64 90.1 MB** |
+
+那 169MB 的 asar 里几乎全是被复制进包的生产依赖（光 mermaid 一个就 83.5MB），而 electron-vite 早已把这些库内联进 `dist`（dist 总共 10MB），所以那份拷贝是死重。asar 瘦身后只剩 `dist` 加 `package.json`，10.7MB，对得上。
+
+**规矩**
+
+- 主进程、preload、渲染层都由 electron-vite 打成完整 bundle，运行时不需要 `node_modules`，因此 `files` 里显式排除 `node_modules/**/*`
+- **例外**：一旦引入运行期从 `node_modules` 加载的包（原生模块 `.node` 是典型），必须把它从排除名单里放出来，否则打包后运行会崩。判断方法：检查 `dist/main/index.js` 里除了 Node 内置模块和 `electron`，还有没有 `require('包名')`
+- 语言包只保留 en / zh（`electronLanguages`），其余 Chromium 语言删掉可省几十 MB
+- mac 默认用 `mac.target` 的 arch 列表打两份产物（`arm64` + `x64`），**不分 universal**：universal 会把两套 Chromium 运行时塞进同一个包，每个用户多下几十 MB。两个架构的 zip 会写进同一个 `latest-mac.yml`，自动更新会按架构自己选，用户无感
+
 ## 时间花在哪里
 
 单架构 `--dir` 实测（arm64 主机、Electron 运行时已在本地缓存，`release/` 干净、无并发打包）：
