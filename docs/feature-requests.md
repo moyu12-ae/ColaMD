@@ -110,9 +110,16 @@ The reveal button shipped in v2.0.4 and v2.0.5 was unreachable, but not because 
 
 ### Portable build (zip distribution)
 
-**Sources:** [#63](https://github.com/marswaveai/ColaMD/issues/63)
+**Sources:** [#63](https://github.com/marswaveai/ColaMD/issues/63), user feedback again on 2026-09-13
 
-Publish the existing mac zip artifact as a visible download alongside the dmg so the app can run unzipped without installation. Windows portable packaging TBD.
+Publish the existing mac zip artifact as a visible download alongside the dmg so the app can run unzipped without installation. The mac side is already published.
+
+Windows is the open half, and a Windows user asked again. Two shapes, and they are not equivalent:
+
+- `zip` target: the unpacked app in an archive. Unzip anywhere and run, nothing touches the registry, "uninstall" is deleting the folder, and startup is unchanged. This is the classic green build.
+- `portable` target: one self-extracting exe. Friendlier to hand around, but it unpacks to a temp folder on every launch, which costs startup time, and antivirus heuristics are less friendly to it.
+
+Both lose what the installer provides: `.md` file association, a Start Menu entry, and automatic updates. A green build needs its own update path (tell the user a new version exists and send them to the download page). Settings location also needs a decision: keep them in `%APPDATA%` like the installed build, or keep them next to the executable for a fully self-contained folder.
 
 ### Slow second-file open
 
@@ -213,6 +220,16 @@ No decision yet on which AI capabilities belong in the editor, and therefore no 
 **Sources:** [#54](https://github.com/marswaveai/ColaMD/issues/54)
 
 Fenced code blocks currently render as plain styled text with a copy button, without language-aware colouring. Adding it means shipping a highlighter and deciding which languages to support, so it stays tracked rather than committed. The issue remains open.
+
+### System WebView shell (Tauri) migration
+
+**Sources:** maintainer discussion, 2026-08-29 and 2026-09-13
+
+On macOS, ColaMD ships Chromium with every download. That single framework is 191 MB unpacked, about 75 MB compressed, and it is the entire reason the dmg is around 82 MB while Typora's is around 14 MB: Typora uses the WebView macOS already provides.
+
+Migration to a system-WebView shell would collapse the download to our own code plus a small runtime. It is a rewrite of the main process, not a build flag: window management, menus, file dialogs, watchers, printing, auto-update and signing all get replaced, and rendering moves to WebKit on macOS, WebView2 on Windows and WebKitGTK on Linux. WebKitGTK is the real risk on Linux, because distro coverage and rendering behaviour vary.
+
+Windows is the honest counterweight: Typora's Windows installer is 86 to 108 MB, close to our 115 MB Setup, because there is no dependable system WebView there. So the 14 MB figure is a macOS-only effect, and the migration only pays off on one of three platforms.
 
 ### Footnote hover preview
 
