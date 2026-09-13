@@ -146,6 +146,8 @@ Requested: keep documents from different paths open together in one window inste
 
 Re-opened as a candidate on 2026-09-11, at the maintainer's request, instead of staying declined. `design.md` still states "no persistent workspace and no full file tree", so the design document must be updated before this is implemented. The shape is also undecided: a tab strip, an extension of the temporary same-directory switcher, or something else that avoids a permanent extra region.
 
+Update (2026-09-13): the shape is settled. `design.md` now defines the tab rules, and the engineering plan lives in [`tabs-tech-design.md`](tabs-tech-design.md). The tab strip covers cross-directory documents and supersedes the same-directory switcher candidate once shipped.
+
 ### Plugin ecosystem
 
 **Raised:** 2026-09-11, by the maintainer.
