@@ -259,13 +259,16 @@ body {
 }
 
 /* --- Tabs (docs/tabs-tech-design.md) ---
-   The bar exists only once a second tab is open (design.md): body.has-tabs
-   lifts --tab-bar-height from 0 and everything below the titlebar shifts. */
+   Visual spec follows the maintainer's prototype
+   (docs/temporary-document-switcher-prototype.html): a soft strip a few
+   percent off the body surface, tabs separated by hairlines, active tab = body
+   paper color with a faint inset baseline and heavier weight — no accent
+   underline. Colors map the prototype roles onto theme tokens. */
 body {
   --tab-bar-height: 0px;
 }
 body.has-tabs {
-  --tab-bar-height: 32px;
+  --tab-bar-height: 31px;
 }
 
 #tab-bar {
@@ -277,10 +280,9 @@ body.has-tabs {
   z-index: 20;
   display: flex;
   align-items: stretch;
-  padding: 0 8px;
-  /* A surface a few percent off the body background, derived from semantic
-     tokens: --code-block-bg is a dark slate in several light themes (elegant,
-     sepia) and would paint a black bar (design.md: subtle light/dark offset). */
+  overflow: hidden;
+  padding: 0 10px;
+  /* --soft in the prototype: a surface just off the body background. */
   background: color-mix(in srgb, var(--bg-color) 94%, var(--text-color));
   border-bottom: 1px solid var(--border-color);
   -webkit-app-region: drag;
@@ -293,36 +295,76 @@ body.has-tabs {
 #tab-list {
   display: flex;
   align-items: stretch;
-  gap: 2px;
   min-width: 0;
   overflow: hidden;
 }
 
 .tab-item {
   -webkit-app-region: no-drag;
+  position: relative;
   display: flex;
   align-items: center;
   box-sizing: border-box;
-  min-width: 60px;
-  max-width: 180px;
-  padding: 0 12px;
-  border-bottom: 2px solid transparent;
+  min-width: 102px;
+  max-width: 204px;
+  padding: 0 28px 0 13px;
+  overflow: hidden;
+  border: 0;
+  border-right: 1px solid color-mix(in srgb, var(--border-color) 55%, transparent);
   color: var(--text-secondary);
   font-size: 12px;
+  text-align: left;
   cursor: default;
   user-select: none;
   white-space: nowrap;
+  transition: color .16s, background .16s;
+}
+
+.tab-item:hover {
+  color: var(--text-color);
+  background: color-mix(in srgb, var(--bg-color) 38%, transparent);
 }
 
 .tab-item.active {
   color: var(--text-color);
   background: var(--bg-color);
-  border-bottom-color: var(--link-color);
+  font-weight: 520;
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--text-color) 12%, transparent);
 }
 
 .tab-name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* The prototype's per-tab ×: invisible until the tab is hovered or active. */
+.tab-close {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  opacity: 0;
+  cursor: default;
+  transition: opacity .16s, background .16s, color .16s;
+}
+
+.tab-item:hover .tab-close,
+.tab-item.active .tab-close {
+  opacity: .72;
+}
+
+.tab-close:hover {
+  background: color-mix(in srgb, var(--text-color) 8%, transparent);
+  color: var(--text-color);
 }
 
 /* Same-directory file panel */

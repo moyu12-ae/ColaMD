@@ -297,7 +297,18 @@ function renderTabStrip(): void {
     item.addEventListener('auxclick', (e) => {
       if (e.button === 1) void window.electronAPI.closeTab(snap.tabId)
     })
-    item.append(label)
+    // The prototype's per-tab close affordance: hidden until hover, present
+    // on the active tab too. Linear SVG per AGENT.md, not a text glyph.
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'tab-close'
+    closeBtn.setAttribute('aria-label', isChinese() ? '关闭标签页' : 'Close tab')
+    closeBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg>'
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      void window.electronAPI.closeTab(snap.tabId)
+    })
+    item.append(label, closeBtn)
     list.appendChild(item)
   }
 }
