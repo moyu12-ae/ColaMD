@@ -4,7 +4,7 @@ import { autoUpdater } from 'electron-updater'
 import { join, basename, dirname, extname, isAbsolute, resolve, relative } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { appendFile, readFile, writeFile, readdir, copyFile, mkdir, stat } from 'fs/promises'
-import { watch, FSWatcher, existsSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { watch, FSWatcher, existsSync, readdirSync, readFileSync, writeFileSync, statSync } from 'fs'
 
 const startupStartedAt = performance.now()
 const startupTraceEnabled = process.env.COLAMD_STARTUP_TRACE === '1'
@@ -167,6 +167,10 @@ interface WindowState {
   watcher: FSWatcher | null
   isInternalSave: boolean
   internalSaveCount: number
+  // mtime of the file as of our last read or write. An autosave refuses to
+  // write when the file on disk is newer, so an edit that landed while the
+  // save was queued is never silently overwritten.
+  lastKnownMtime: number
   // Content of our last internal write/load. Delayed FSEvents echoes of our
   // own writes are skipped when the disk still holds exactly this content.
   lastInternalSaveContent: string | null
@@ -199,7 +203,7 @@ const pendingDocumentStateRequests = new Map<string, PendingDocumentStateRequest
 function getState(win: BrowserWindow): WindowState {
   let state = windowStates.get(win.id)
   if (!state) {
-    state = { filePath: null, browsePath: null, watcher: null, isInternalSave: false, internalSaveCount: 0, lastInternalSaveContent: null, debounceTimer: null, siblingsTimer: null, dirty: false, closePromise: null, rendererReady: false, writeQueue: Promise.resolve(), closeAuthorized: false }
+    state = { filePath: null, browsePath: null, watcher: null, isInternalSave: false, internalSaveCount: 0, lastKnownMtime: 0, lastInternalSaveContent: null, debounceTimer: null, siblingsTimer: null, dirty: false, closePromise: null, rendererReady: false, writeQueue: Promise.resolve(), closeAuthorized: false }
     windowStates.set(win.id, state)
   }
   return state
@@ -207,6 +211,35 @@ function getState(win: BrowserWindow): WindowState {
 
 function getWinFromEvent(event: Electron.IpcMainInvokeEvent): BrowserWindow | null {
   return BrowserWindow.fromWebContents(event.sender)
+}
+
+// Modification time of the file on disk, or 0 when it cannot be read.
+function fileMtimeMs(filePath: string): number {
+  try {
+    return statSync(filePath).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+// True when the file changed after our own last read or write, meaning there is
+// an external edit this window has not seen yet. A 1ms tolerance absorbs
+// filesystem timestamp rounding.
+function fileChangedExternally(filePath: string, state: WindowState): boolean {
+  if (!state.lastKnownMtime || filePath !== state.filePath) return false
+  const diskMtime = fileMtimeMs(filePath)
+  if (!diskMtime) return false
+  return diskMtime > state.lastKnownMtime + 1
+}
+
+// Hand the renderer the version now on disk so the existing external-change
+// flow can ask the user which side to keep.
+function notifyExternalChange(win: BrowserWindow, filePath: string): void {
+  void readFile(filePath, 'utf-8')
+    .then((data) => {
+      if (!win.isDestroyed()) win.webContents.send('file-changed', resolveImagePaths(data, filePath))
+    })
+    .catch(() => { /* the watcher picks it up on the next event */ })
 }
 
 function createWindow(filePath?: string, initialContent?: string, initialBrowsePath?: string): BrowserWindow {
@@ -327,6 +360,7 @@ function watchFile(win: BrowserWindow, state: WindowState): void {
           // wipe anything typed since the save. Skip self-echoes.
           if (state.lastInternalSaveContent !== null && data === state.lastInternalSaveContent) return
           state.lastInternalSaveContent = null
+          state.lastKnownMtime = fileMtimeMs(filePath)
           if (!win.isDestroyed()) win.webContents.send('file-changed', resolveImagePaths(data, filePath))
         })
         .catch(() => { /* file mid-replace; a follow-up event will re-trigger */ })
@@ -469,6 +503,7 @@ function loadFileInWindow(win: BrowserWindow, filePath: string): void {
       updateTitle(win)
       pushRecentFile(filePath, true)
       state.lastInternalSaveContent = data
+      state.lastKnownMtime = fileMtimeMs(filePath)
       win.webContents.send('file-opened', { path: filePath, content: resolveImagePaths(data, filePath) })
     } catch {
       // Keep the current document when the selected file cannot be read.
@@ -532,6 +567,7 @@ function saveToPath(win: BrowserWindow, filePath: string, content: string, sourc
       const dataToWrite = restoreImagePaths(content, filePath)
       await writeFile(filePath, dataToWrite, 'utf-8')
       state.lastInternalSaveContent = dataToWrite
+      state.lastKnownMtime = fileMtimeMs(filePath)
       if (win.isDestroyed() || state.filePath !== sourcePath) return false
       state.filePath = filePath
       state.browsePath = dirname(filePath)
@@ -693,7 +729,7 @@ ipcMain.handle('open-sibling', async (event, filePath: string) => {
   return true
 })
 
-ipcMain.handle('save-file', async (event, content: string, expectedPath?: string, rebuildMenu?: boolean) => {
+ipcMain.handle('save-file', async (event, content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => {
   const win = getWinFromEvent(event)
   if (!win) return null
   const state = getState(win)
@@ -712,6 +748,14 @@ ipcMain.handle('save-file', async (event, content: string, expectedPath?: string
     })
     if (result.canceled || !result.filePath) return null
     filePath = result.filePath
+  }
+  // Auto-save never overwrites an edit that landed after our last read or
+  // write: the watcher can miss it (an event during our own write is dropped as
+  // a self-echo), so probe the mtime and let the user decide instead. A manual
+  // save keeps the old behavior, because the user asked for it explicitly.
+  if (autosave && fileChangedExternally(filePath, state)) {
+    notifyExternalChange(win, filePath)
+    return null
   }
   const ok = await saveToPath(win, filePath, content, sourcePath, rebuildMenu ?? false)
   return ok ? filePath : null

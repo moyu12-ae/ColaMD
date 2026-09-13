@@ -177,7 +177,9 @@ async function runAutosave(): Promise<void> {
   const filePath = currentFilePath
   const content = getContent()
   // rebuildMenu=false: autosave must never rebuild the app menu (macOS IME)
-  const path = await enqueueSave(() => window.electronAPI.saveFile(content, filePath, false))
+  // autosave=true: the main process may refuse the write when the file changed
+  // on disk since our last read or write, and ask the user instead.
+  const path = await enqueueSave(() => window.electronAPI.saveFile(content, filePath, false, true))
   if (path && revision === documentRevision && currentFilePath === filePath) {
     currentFilePath = path
     clearDirty()
