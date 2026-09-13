@@ -6,21 +6,40 @@ export interface SiblingFile {
   kind: 'file' | 'directory' | 'parent'
 }
 
-type FileOpenedData = { path: string | null; content: string }
+type FileOpenedData = { path: string | null; content: string; tabId: number }
+type FileChangedData = { content: string; tabId: number }
+type TabClosedData = { closedTabId: number; activateTabId: number | null }
+export interface TabDocState {
+  tabId: number
+  path: string | null
+  dirty: boolean
+  content?: string
+}
+type DocumentStateSnapshot = { tabs: TabDocState[] }
 type ImageExportPreset = 'desktop' | 'mobile'
 type ImageExportSnapshot = { html: string; styles: string; bodyClass: string; background: string }
 export type FileManagerName = 'finder' | 'explorer' | 'file-manager'
 
 const pendingFileOpened: FileOpenedData[] = []
 let fileOpenedHandler: ((data: FileOpenedData) => void) | null = null
+const pendingNewTab: number[] = []
+let newTabHandler: ((tabId: number) => void) | null = null
 
-// Register this listener as soon as preload starts. The main process can send
-// the initial content before the renderer finishes registering its callbacks.
+// Register these listeners as soon as preload starts. The main process can
+// send the initial tab and content before the renderer finishes registering
+// its callbacks.
 ipcRenderer.on('file-opened', (_event, data: FileOpenedData) => {
   if (fileOpenedHandler) {
     fileOpenedHandler(data)
   } else {
     pendingFileOpened.push(data)
+  }
+})
+ipcRenderer.on('new-tab', (_event, tabId: number) => {
+  if (newTabHandler) {
+    newTabHandler(tabId)
+  } else {
+    pendingNewTab.push(tabId)
   }
 })
 
@@ -32,8 +51,11 @@ export interface ElectronAPI {
   showEntryContextMenu: (path: string, kind: 'file' | 'directory') => Promise<void>
   listSiblings: () => Promise<SiblingFile[] | null>
   openSibling: (path: string) => Promise<boolean>
-  saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => Promise<string | null>
-  saveFileAs: (content: string, expectedPath?: string) => Promise<string | null>
+  saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean, tabId?: number) => Promise<string | null>
+  saveFileAs: (content: string, expectedPath?: string, tabId?: number) => Promise<string | null>
+  newTab: () => Promise<number>
+  closeTab: (tabId: number) => Promise<void>
+  notifyActiveTab: (tabId: number) => void
   exportPDF: () => Promise<boolean>
   exportHTML: (snapshot: { content: string; html: string; styles: string; bodyClass: string }) => Promise<boolean>
   exportDOCX: (content: string) => Promise<boolean>
@@ -45,9 +67,12 @@ export interface ElectronAPI {
   reportTheme: (theme: string) => Promise<void>
   getPathForFile: (file: File) => string
   openExternal: (url: string) => void
-  onFileChanged: (callback: (content: string) => void) => void
+  onFileChanged: (callback: (data: FileChangedData) => void) => void
   onNewFile: (callback: () => void) => void
   onFileOpened: (callback: (data: FileOpenedData) => void) => void
+  onNewTab: (callback: (tabId: number) => void) => void
+  onTabClosed: (callback: (data: TabClosedData) => void) => void
+  onActivateTab: (callback: (tabId: number) => void) => void
   onMenuOpen: (callback: () => void) => void
   onMenuSave: (callback: () => void) => void
   onMenuSaveAs: (callback: () => void) => void
@@ -75,10 +100,10 @@ export interface ElectronAPI {
   onUpdateError: (callback: () => void) => void
   downloadUpdate: () => Promise<void>
   installUpdate: () => Promise<void>
-  reportDirty: (isDirty: boolean) => void
+  reportDirty: (isDirty: boolean, tabId?: number) => void
   reportRendererReady: () => void
   onRequestDocumentState: (callback: (requestId: string) => void) => void
-  respondDocumentState: (requestId: string, snapshot: { dirty: boolean; content: string }) => void
+  respondDocumentState: (requestId: string, snapshot: DocumentStateSnapshot) => void
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -89,8 +114,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   showEntryContextMenu: (path: string, kind: 'file' | 'directory') => ipcRenderer.invoke('entry-context-menu', path, kind) as Promise<void>,
   listSiblings: () => ipcRenderer.invoke('list-siblings'),
   openSibling: (path: string) => ipcRenderer.invoke('open-sibling', path),
-  saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => ipcRenderer.invoke('save-file', content, expectedPath, rebuildMenu, autosave),
-  saveFileAs: (content: string, expectedPath?: string) => ipcRenderer.invoke('save-file-as', content, expectedPath),
+  saveFile: (content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean, tabId?: number) => ipcRenderer.invoke('save-file', content, expectedPath, rebuildMenu, autosave, tabId),
+  saveFileAs: (content: string, expectedPath?: string, tabId?: number) => ipcRenderer.invoke('save-file-as', content, expectedPath, tabId),
+  newTab: () => ipcRenderer.invoke('new-tab') as Promise<number>,
+  closeTab: (tabId: number) => ipcRenderer.invoke('close-tab', tabId) as Promise<void>,
+  notifyActiveTab: (tabId: number) => ipcRenderer.send('active-tab-changed', tabId),
   exportPDF: () => ipcRenderer.invoke('export-pdf'),
   exportHTML: (snapshot: { content: string; html: string; styles: string; bodyClass: string }) => ipcRenderer.invoke('export-html', snapshot),
   exportDOCX: (content: string) => ipcRenderer.invoke('export-docx', content),
@@ -106,8 +134,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   reportTheme: (theme: string) => ipcRenderer.invoke('report-theme', theme),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   openExternal: (url: string) => ipcRenderer.send('open-external', url),
-  onFileChanged: (callback: (content: string) => void) => {
-    ipcRenderer.on('file-changed', (_event, content) => callback(content))
+  onFileChanged: (callback: (data: FileChangedData) => void) => {
+    ipcRenderer.on('file-changed', (_event, data: FileChangedData) => callback(data))
   },
   onNewFile: (callback: () => void) => {
     ipcRenderer.on('new-file', () => callback())
@@ -115,6 +143,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onFileOpened: (callback: (data: FileOpenedData) => void) => {
     fileOpenedHandler = callback
     for (const data of pendingFileOpened.splice(0)) callback(data)
+  },
+  onNewTab: (callback: (tabId: number) => void) => {
+    newTabHandler = callback
+    for (const tabId of pendingNewTab.splice(0)) callback(tabId)
+  },
+  onTabClosed: (callback: (data: TabClosedData) => void) => {
+    ipcRenderer.on('tab-closed', (_event, data: TabClosedData) => callback(data))
+  },
+  onActivateTab: (callback: (tabId: number) => void) => {
+    ipcRenderer.on('activate-tab', (_event, tabId: number) => callback(tabId))
   },
   onMenuOpen: (callback: () => void) => {
     ipcRenderer.on('menu-open', () => callback())
@@ -195,12 +233,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
-  reportDirty: (isDirty: boolean) => ipcRenderer.send('set-dirty', isDirty),
+  reportDirty: (isDirty: boolean, tabId?: number) => ipcRenderer.send('set-dirty', isDirty, tabId),
   reportRendererReady: () => ipcRenderer.send('renderer-ready'),
   onRequestDocumentState: (callback: (requestId: string) => void) => {
     ipcRenderer.on('request-document-state', (_event, requestId) => callback(requestId))
   },
-  respondDocumentState: (requestId: string, snapshot: { dirty: boolean; content: string }) => {
+  respondDocumentState: (requestId: string, snapshot: DocumentStateSnapshot) => {
     ipcRenderer.send('document-state-response', requestId, snapshot)
   }
 } satisfies ElectronAPI)

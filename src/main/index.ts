@@ -160,8 +160,11 @@ async function scanCustomThemes(): Promise<string[]> {
   }
 }
 
-// Per-window state
-interface WindowState {
+// Per-window state. The window is a shell; every open document lives in a
+// TabState with its own watcher, mtime bookkeeping, and write queue, so two
+// tabs can never clobber each other's file or echo suppression (docs/tabs-tech-design.md D3).
+interface TabState {
+  tabId: number
   filePath: string | null
   browsePath: string | null
   watcher: FSWatcher | null
@@ -175,22 +178,30 @@ interface WindowState {
   // own writes are skipped when the disk still holds exactly this content.
   lastInternalSaveContent: string | null
   debounceTimer: ReturnType<typeof setTimeout> | null
-  siblingsTimer: ReturnType<typeof setTimeout> | null
   dirty: boolean
+  writeQueue: Promise<void>
+}
+
+interface WindowState {
+  tabs: Map<number, TabState>
+  activeTabId: number
+  nextTabId: number
+  siblingsTimer: ReturnType<typeof setTimeout> | null
   closePromise: Promise<boolean> | null
   rendererReady: boolean
-  writeQueue: Promise<void>
   closeAuthorized: boolean
 }
 
-interface DocumentSnapshot {
+interface TabDocState {
+  tabId: number
+  path: string | null
   dirty: boolean
-  content: string
+  content?: string
 }
 
 interface PendingDocumentStateRequest {
   webContentsId: number
-  resolve: (snapshot: DocumentSnapshot | null) => void
+  resolve: (tabs: TabDocState[] | null) => void
   timer: ReturnType<typeof setTimeout>
 }
 
@@ -203,10 +214,51 @@ const pendingDocumentStateRequests = new Map<string, PendingDocumentStateRequest
 function getState(win: BrowserWindow): WindowState {
   let state = windowStates.get(win.id)
   if (!state) {
-    state = { filePath: null, browsePath: null, watcher: null, isInternalSave: false, internalSaveCount: 0, lastKnownMtime: 0, lastInternalSaveContent: null, debounceTimer: null, siblingsTimer: null, dirty: false, closePromise: null, rendererReady: false, writeQueue: Promise.resolve(), closeAuthorized: false }
+    state = { tabs: new Map(), activeTabId: -1, nextTabId: 0, siblingsTimer: null, closePromise: null, rendererReady: false, closeAuthorized: false }
     windowStates.set(win.id, state)
   }
   return state
+}
+
+function createTab(win: BrowserWindow): TabState {
+  const state = getState(win)
+  const tab: TabState = {
+    tabId: state.nextTabId,
+    filePath: null,
+    browsePath: null,
+    watcher: null,
+    isInternalSave: false,
+    internalSaveCount: 0,
+    lastKnownMtime: 0,
+    lastInternalSaveContent: null,
+    debounceTimer: null,
+    dirty: false,
+    writeQueue: Promise.resolve()
+  }
+  state.nextTabId += 1
+  state.tabs.set(tab.tabId, tab)
+  return tab
+}
+
+// Resolve the tab an IPC call targets: an explicit tabId when the renderer
+// supplies one, otherwise the window's active tab.
+function getTab(win: BrowserWindow, tabId?: unknown): TabState | null {
+  const state = getState(win)
+  if (typeof tabId === 'number' && Number.isInteger(tabId) && state.tabs.has(tabId)) {
+    return state.tabs.get(tabId) ?? null
+  }
+  return state.tabs.get(state.activeTabId) ?? null
+}
+
+function activeTabOf(state: WindowState): TabState | null {
+  return state.tabs.get(state.activeTabId) ?? null
+}
+
+function hasDirtyTabs(state: WindowState): boolean {
+  for (const tab of state.tabs.values()) {
+    if (tab.dirty) return true
+  }
+  return false
 }
 
 function getWinFromEvent(event: Electron.IpcMainInvokeEvent): BrowserWindow | null {
@@ -225,19 +277,19 @@ function fileMtimeMs(filePath: string): number {
 // True when the file changed after our own last read or write, meaning there is
 // an external edit this window has not seen yet. A 1ms tolerance absorbs
 // filesystem timestamp rounding.
-function fileChangedExternally(filePath: string, state: WindowState): boolean {
-  if (!state.lastKnownMtime || filePath !== state.filePath) return false
+function fileChangedExternally(filePath: string, tab: TabState): boolean {
+  if (!tab.lastKnownMtime || filePath !== tab.filePath) return false
   const diskMtime = fileMtimeMs(filePath)
   if (!diskMtime) return false
-  return diskMtime > state.lastKnownMtime + 1
+  return diskMtime > tab.lastKnownMtime + 1
 }
 
 // Hand the renderer the version now on disk so the existing external-change
 // flow can ask the user which side to keep.
-function notifyExternalChange(win: BrowserWindow, filePath: string): void {
+function notifyExternalChange(win: BrowserWindow, filePath: string, tabId: number): void {
   void readFile(filePath, 'utf-8')
     .then((data) => {
-      if (!win.isDestroyed()) win.webContents.send('file-changed', resolveImagePaths(data, filePath))
+      if (!win.isDestroyed()) win.webContents.send('file-changed', { tabId, content: resolveImagePaths(data, filePath) })
     })
     .catch(() => { /* the watcher picks it up on the next event */ })
 }
@@ -262,7 +314,8 @@ function createWindow(filePath?: string, initialContent?: string, initialBrowseP
   markStartup('window-created')
 
   const state = getState(win)
-  if (initialBrowsePath) state.browsePath = initialBrowsePath
+  const initialTab = createTab(win)
+  if (initialBrowsePath) initialTab.browsePath = initialBrowsePath
 
   if (process.env.ELECTRON_RENDERER_URL) {
     win.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -272,19 +325,23 @@ function createWindow(filePath?: string, initialContent?: string, initialBrowseP
 
   win.webContents.on('did-finish-load', () => {
     markStartup('renderer-loaded')
+    // Announce the window's first tab before any content so the renderer can
+    // build its session bookkeeping, then load into it.
+    win.webContents.send('new-tab', initialTab.tabId)
     if (filePath) {
-      loadFileInWindow(win, filePath)
+      loadFileInTab(win, initialTab, filePath)
     } else if (initialContent) {
       // In-memory content (e.g. the Markdown cheatsheet) — no file, no watcher
-      win.webContents.send('file-opened', { path: null, content: initialContent })
+      initialTab.lastInternalSaveContent = initialContent
+      win.webContents.send('file-opened', { tabId: initialTab.tabId, path: null, content: initialContent })
     }
   })
 
   // Intercept window close: confirm unsaved changes before the window dies.
-  // cmd+w (role: 'close') and quit both funnel through here.
+  // cmd+w closing the last tab and quit both funnel through here.
   win.on('close', (e) => {
     const st = getState(win)
-    if (isQuitting || st.closeAuthorized || (!st.rendererReady && !st.dirty)) return
+    if (isQuitting || st.closeAuthorized || (!st.rendererReady && !hasDirtyTabs(st))) return
     e.preventDefault()
     void confirmWindowClose(win, st).then((ok) => {
       if (ok && !win.isDestroyed()) {
@@ -295,7 +352,7 @@ function createWindow(filePath?: string, initialContent?: string, initialBrowseP
   })
 
   win.on('closed', () => {
-    stopWatching(state)
+    for (const tab of state.tabs.values()) stopWatching(tab)
     windowStates.delete(win.id)
   })
 
@@ -305,13 +362,14 @@ function createWindow(filePath?: string, initialContent?: string, initialBrowseP
 
 function updateTitle(win: BrowserWindow): void {
   const state = getState(win)
-  const fileName = state.filePath ? basename(state.filePath) : 'Untitled'
+  const active = activeTabOf(state)
+  const fileName = active?.filePath ? basename(active.filePath) : 'Untitled'
   win.setTitle(`${fileName} — ColaMD`)
 }
 
 function suggestFileName(win: BrowserWindow, content?: string): string | undefined {
-  const state = getState(win)
-  if (state.filePath) return basename(state.filePath, '.md')
+  const active = activeTabOf(getState(win))
+  if (active?.filePath) return basename(active.filePath, '.md')
   if (!content) return undefined
   // Extract first heading or first non-empty line
   const match = content.match(/^#\s+(.+)/m) || content.match(/^(.+)/m)
@@ -326,24 +384,26 @@ function suggestSavePath(win: BrowserWindow, fileName?: string): string | undefi
   const state = getState(win)
   const name = fileName ?? suggestFileName(win)
   if (!name) return undefined
-  return state.filePath ? join(dirname(state.filePath), name) : name
+  return activeTabOf(state)?.filePath ? join(dirname(activeTabOf(state)!.filePath!), name) : name
 }
 
-function stopWatching(state: WindowState): void {
-  if (state.watcher) {
-    state.watcher.close()
-    state.watcher = null
+function stopWatching(tab: TabState): void {
+  if (tab.watcher) {
+    tab.watcher.close()
+    tab.watcher = null
   }
 }
 
-function watchFile(win: BrowserWindow, state: WindowState): void {
-  if (!state.filePath) return
-  if (state.watcher) {
-    state.watcher.close()
-    state.watcher = null
+function watchFile(win: BrowserWindow, tab: TabState): void {
+  if (!tab.filePath) return
+  if (tab.watcher) {
+    tab.watcher.close()
+    tab.watcher = null
   }
 
-  const filePath = state.filePath
+  const state = getState(win)
+  const filePath = tab.filePath
+  const tabId = tab.tabId
   const dir = dirname(filePath)
   const fileName = basename(filePath)
   // macOS FSEvents replays recent history when a watcher starts; drop events
@@ -351,24 +411,24 @@ function watchFile(win: BrowserWindow, state: WindowState): void {
   let suppressUntil = 0
 
   const scheduleReload = (): void => {
-    if (state.debounceTimer) clearTimeout(state.debounceTimer)
-    state.debounceTimer = setTimeout(() => {
+    if (tab.debounceTimer) clearTimeout(tab.debounceTimer)
+    tab.debounceTimer = setTimeout(() => {
       readFile(filePath, 'utf-8')
         .then((data) => {
           // Our own writes echo back through FSEvents long after the internal
           // save window closes; reloading them would revert the editor and
           // wipe anything typed since the save. Skip self-echoes.
-          if (state.lastInternalSaveContent !== null && data === state.lastInternalSaveContent) return
-          state.lastInternalSaveContent = null
-          state.lastKnownMtime = fileMtimeMs(filePath)
-          if (!win.isDestroyed()) win.webContents.send('file-changed', resolveImagePaths(data, filePath))
+          if (tab.lastInternalSaveContent !== null && data === tab.lastInternalSaveContent) return
+          tab.lastInternalSaveContent = null
+          tab.lastKnownMtime = fileMtimeMs(filePath)
+          if (!win.isDestroyed()) win.webContents.send('file-changed', { tabId, content: resolveImagePaths(data, filePath) })
         })
         .catch(() => { /* file mid-replace; a follow-up event will re-trigger */ })
     }, 100)
   }
 
   const onExternalChange = (): void => {
-    if (state.isInternalSave) return
+    if (tab.isInternalSave) return
     if (Date.now() < suppressUntil) return
 
     scheduleReload()
@@ -379,19 +439,19 @@ function watchFile(win: BrowserWindow, state: WindowState): void {
     if (state.siblingsTimer) clearTimeout(state.siblingsTimer)
     state.siblingsTimer = setTimeout(() => {
       state.siblingsTimer = null
-      if (state.filePath !== filePath) return // file switched meanwhile; new watcher handles it
-      listSiblingFiles(filePath, state.browsePath ?? dirname(filePath)).then((files) => {
+      if (tab.filePath !== filePath) return // file switched meanwhile; new watcher handles it
+      listSiblingFiles(filePath, tab.browsePath ?? dirname(filePath)).then((files) => {
         if (!win.isDestroyed()) win.webContents.send('siblings-changed', files)
       })
     }, 300)
   }
 
   const establish = (): void => {
-    if (state.filePath !== filePath) return
+    if (tab.filePath !== filePath) return
     suppressUntil = Date.now() + 300
-    if (state.watcher) {
-      state.watcher.close()
-      state.watcher = null
+    if (tab.watcher) {
+      tab.watcher.close()
+      tab.watcher = null
     }
     try {
       // Watch the parent directory instead of the file: agents often save
@@ -399,7 +459,7 @@ function watchFile(win: BrowserWindow, state: WindowState): void {
       // inode and silently kills a watcher bound to the old file. A
       // directory watcher survives those and keeps reporting our filename.
       const watcher = watch(dir, (eventType, filename) => {
-        if (state.isInternalSave) return
+        if (tab.isInternalSave) return
         // filename may be null on some platforms — treat as our file
         if (filename !== null && filename !== fileName) {
           // A sibling file changed (agent created / renamed / deleted it)
@@ -423,16 +483,16 @@ function watchFile(win: BrowserWindow, state: WindowState): void {
         // recover automatically when the file comes back.
         establish()
       })
-      state.watcher = watcher
+      tab.watcher = watcher
     } catch {
       // Fallback: watch the file directly if the directory isn't watchable
       try {
         const watcher = watch(filePath, (eventType) => {
-          if (eventType !== 'change' || state.isInternalSave) return
+          if (eventType !== 'change' || tab.isInternalSave) return
           onExternalChange()
         })
         watcher.on('error', () => establish())
-        state.watcher = watcher
+        tab.watcher = watcher
       } catch { /* file not watchable; nothing to do */ }
     }
   }
@@ -491,101 +551,108 @@ function restoreImagePaths(content: string, filePath: string): string {
   })
 }
 
-function loadFileInWindow(win: BrowserWindow, filePath: string): void {
-  const state = getState(win)
+function loadFileInTab(win: BrowserWindow, tab: TabState, filePath: string): void {
   const operation = async (): Promise<void> => {
     try {
       const data = await readFile(filePath, 'utf-8')
       if (win.isDestroyed()) return
-      state.filePath = filePath
-      state.browsePath = dirname(filePath)
-      watchFile(win, state)
-      updateTitle(win)
+      tab.filePath = filePath
+      tab.browsePath = dirname(filePath)
+      watchFile(win, tab)
+      if (getState(win).activeTabId === tab.tabId) updateTitle(win)
       pushRecentFile(filePath, true)
-      state.lastInternalSaveContent = data
-      state.lastKnownMtime = fileMtimeMs(filePath)
-      win.webContents.send('file-opened', { path: filePath, content: resolveImagePaths(data, filePath) })
+      tab.lastInternalSaveContent = data
+      tab.lastKnownMtime = fileMtimeMs(filePath)
+      win.webContents.send('file-opened', { tabId: tab.tabId, path: filePath, content: resolveImagePaths(data, filePath) })
     } catch {
       // Keep the current document when the selected file cannot be read.
     }
   }
-  const next = state.writeQueue.then(operation, operation)
-  state.writeQueue = next.then(() => undefined, () => undefined)
+  const next = tab.writeQueue.then(operation, operation)
+  tab.writeQueue = next.then(() => undefined, () => undefined)
 }
 
-// Find window that already has this file open
-function findWindowForFile(filePath: string): BrowserWindow | null {
+// Find the window and tab that already have this file open.
+function findTabForFile(filePath: string): { win: BrowserWindow; state: WindowState; tab: TabState } | null {
   for (const [id, state] of windowStates) {
-    if (state.filePath === filePath) {
-      return BrowserWindow.fromId(id) || null
+    for (const tab of state.tabs.values()) {
+      if (tab.filePath === filePath) {
+        const win = BrowserWindow.fromId(id)
+        if (win) return { win, state, tab }
+      }
     }
   }
   return null
 }
 
-// Open file: reuse existing window or create new one
-function openFile(filePath: string): void {
-  // If already open, focus that window
-  const existing = findWindowForFile(filePath)
-  if (existing) {
-    existing.focus()
+// design.md: opening a file never spawns a tab on its own. It loads into the
+// current tab of the target window; only a blank, unmodified current tab is
+// silently overwritten (the old "reuse empty window" rule, now per tab).
+async function openIntoWindow(win: BrowserWindow, filePath: string): Promise<void> {
+  const state = getState(win)
+  const tab = activeTabOf(state) ?? createTab(win)
+  state.activeTabId = tab.tabId
+  if (!tab.filePath && !tab.dirty) {
+    loadFileInTab(win, tab, filePath)
+    win.focus()
     return
   }
-
-  // Find an untitled empty window to reuse
-  const emptyWin = findEmptyWindow()
-  if (emptyWin) {
-    loadFileInWindow(emptyWin, filePath)
-    emptyWin.focus()
-    return
-  }
-
-  // Create new window
-  const win = createWindow(filePath)
+  if (tab.dirty && !await confirmAndSaveTab(win, tab)) return
+  loadFileInTab(win, tab, filePath)
   win.focus()
 }
 
-function findEmptyWindow(): BrowserWindow | null {
-  for (const [id, state] of windowStates) {
-    if (!state.filePath) {
-      return BrowserWindow.fromId(id) || null
-    }
+// Open file: focus the existing tab, or load into the focused window's
+// current tab, or create a window when none exists.
+function openFile(filePath: string): void {
+  const existing = findTabForFile(filePath)
+  if (existing) {
+    existing.state.activeTabId = existing.tab.tabId
+    existing.win.focus()
+    existing.win.webContents.send('activate-tab', existing.tab.tabId)
+    return
   }
-  return null
+
+  const win = getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed()) ?? null
+  if (!win) {
+    createWindow(filePath).focus()
+    return
+  }
+  void openIntoWindow(win, filePath)
 }
 
-// Serialize writes per window. A save is valid only while its source document
-// remains active; stale queued work must neither overwrite window state nor
+// Serialize writes per tab. A save is valid only while its source document
+// remains in that tab; stale queued work must neither overwrite tab state nor
 // make a later document appear saved.
-function saveToPath(win: BrowserWindow, filePath: string, content: string, sourcePath: string | null, rebuildMenu = false): Promise<boolean> {
+function saveToPath(win: BrowserWindow, tab: TabState, filePath: string, content: string, sourcePath: string | null, rebuildMenu = false): Promise<boolean> {
   const state = getState(win)
   const operation = async (): Promise<boolean> => {
-    if (win.isDestroyed() || state.filePath !== sourcePath) return false
+    if (win.isDestroyed() || !state.tabs.has(tab.tabId) || tab.filePath !== sourcePath) return false
     try {
-      state.internalSaveCount += 1
-      state.isInternalSave = true
+      tab.internalSaveCount += 1
+      tab.isInternalSave = true
       const dataToWrite = restoreImagePaths(content, filePath)
       await writeFile(filePath, dataToWrite, 'utf-8')
-      state.lastInternalSaveContent = dataToWrite
-      state.lastKnownMtime = fileMtimeMs(filePath)
-      if (win.isDestroyed() || state.filePath !== sourcePath) return false
-      state.filePath = filePath
-      state.browsePath = dirname(filePath)
-      watchFile(win, state)
-      updateTitle(win)
+      tab.lastInternalSaveContent = dataToWrite
+      tab.lastKnownMtime = fileMtimeMs(filePath)
+      if (win.isDestroyed() || tab.filePath !== sourcePath) return false
+      tab.filePath = filePath
+      tab.browsePath = dirname(filePath)
+      watchFile(win, tab)
+      if (state.activeTabId === tab.tabId) updateTitle(win)
       pushRecentFile(filePath, rebuildMenu)
       return true
     } catch {
       return false
     } finally {
       setTimeout(() => {
-        state.internalSaveCount = Math.max(0, state.internalSaveCount - 1)
-        state.isInternalSave = state.internalSaveCount > 0
+        tab.internalSaveCount = Math.max(0, tab.internalSaveCount - 1)
+        tab.isInternalSave = tab.internalSaveCount > 0
       }, 100)
     }
   }
-  const next = state.writeQueue.then(operation, operation)
-  state.writeQueue = next.then(() => undefined, () => undefined)
+  const next = tab.writeQueue.then(operation, operation)
+  tab.writeQueue = next.then(() => undefined, () => undefined)
   return next
 }
 
@@ -628,7 +695,7 @@ ipcMain.handle('entry-context-menu', (event, targetPath: unknown, kind: unknown)
 ipcMain.handle('reveal-file', (event) => {
   const win = getWinFromEvent(event)
   if (!win) return false
-  const filePath = getState(win).filePath
+  const filePath = activeTabOf(getState(win))?.filePath
   if (!filePath) return false
   try {
     shell.showItemInFolder(filePath)
@@ -650,63 +717,24 @@ ipcMain.handle('open-file', async (event) => {
     properties: ['openFile']
   })
   if (result.canceled || result.filePaths.length === 0) return null
-
-  const filePath = result.filePaths[0]
-
-  // If this window has no file, load here; otherwise open in new window
-  const state = getState(win)
-  if (!state.filePath) {
-    try {
-      const content = await readFile(filePath, 'utf-8')
-      state.filePath = filePath
-      state.browsePath = dirname(filePath)
-      watchFile(win, state)
-      updateTitle(win)
-      pushRecentFile(filePath, true)
-      state.lastInternalSaveContent = content
-      win.webContents.send('file-opened', { path: filePath, content: resolveImagePaths(content, filePath) })
-      return { path: filePath, content }
-    } catch {
-      return null
-    }
-  } else {
-    openFile(filePath)
-    return null
-  }
+  // Dedup + reuse-blank-tab + overwrite-with-confirm all live in openFile.
+  openFile(result.filePaths[0])
+  return null
 })
 
 ipcMain.handle('open-file-path', async (event, filePath: string) => {
   const win = getWinFromEvent(event)
-  if (!win) return null
-  const state = getState(win)
-
-  // If this window has no file, load here
-  if (!state.filePath) {
-    try {
-      const content = await readFile(filePath, 'utf-8')
-      state.filePath = filePath
-      state.browsePath = dirname(filePath)
-      watchFile(win, state)
-      updateTitle(win)
-      pushRecentFile(filePath, true)
-      state.lastInternalSaveContent = content
-      win.webContents.send('file-opened', { path: filePath, content: resolveImagePaths(content, filePath) })
-      return { path: filePath, content }
-    } catch {
-      return null
-    }
-  } else {
-    openFile(filePath)
-    return null
-  }
+  if (!win || typeof filePath !== 'string') return null
+  openFile(filePath)
+  return null
 })
 
 // Same-directory file panel: list markdown files next to the open file
 ipcMain.handle('list-siblings', async (event) => {
   const win = getWinFromEvent(event)
   if (!win) return null
-  const state = getState(win)
-  return listSiblingFiles(state.filePath, state.browsePath ?? undefined)
+  const active = activeTabOf(getState(win))
+  return listSiblingFiles(active?.filePath ?? null, active?.browsePath ?? undefined)
 })
 
 // Open a Markdown file or navigate into a directory from the file panel.
@@ -715,25 +743,26 @@ ipcMain.handle('open-sibling', async (event, filePath: string) => {
   if (!win || typeof filePath !== 'string') return false
   try {
     const info = await stat(filePath)
-    const state = getState(win)
-    if (info.isDirectory()) {
-      state.browsePath = filePath
-      const files = await listSiblingFiles(state.filePath, filePath)
+    const active = activeTabOf(getState(win))
+    if (info.isDirectory() && active) {
+      active.browsePath = filePath
+      const files = await listSiblingFiles(active.filePath, filePath)
       if (!win.isDestroyed()) win.webContents.send('siblings-changed', files)
       return true
     }
   } catch {
     return false
   }
-  loadFileInWindow(win, filePath)
+  openFile(filePath)
   return true
 })
 
-ipcMain.handle('save-file', async (event, content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean) => {
+ipcMain.handle('save-file', async (event, content: string, expectedPath?: string, rebuildMenu?: boolean, autosave?: boolean, tabId?: number) => {
   const win = getWinFromEvent(event)
   if (!win) return null
-  const state = getState(win)
-  const sourcePath = state.filePath
+  const tab = getTab(win, tabId)
+  if (!tab) return null
+  const sourcePath = tab.filePath
   // A queued auto-save must never write an old document into a file opened
   // after the save was scheduled.
   if (expectedPath && sourcePath !== expectedPath) return null
@@ -753,18 +782,20 @@ ipcMain.handle('save-file', async (event, content: string, expectedPath?: string
   // write: the watcher can miss it (an event during our own write is dropped as
   // a self-echo), so probe the mtime and let the user decide instead. A manual
   // save keeps the old behavior, because the user asked for it explicitly.
-  if (autosave && fileChangedExternally(filePath, state)) {
-    notifyExternalChange(win, filePath)
+  if (autosave && fileChangedExternally(filePath, tab)) {
+    notifyExternalChange(win, filePath, tab.tabId)
     return null
   }
-  const ok = await saveToPath(win, filePath, content, sourcePath, rebuildMenu ?? false)
+  const ok = await saveToPath(win, tab, filePath, content, sourcePath, rebuildMenu ?? false)
   return ok ? filePath : null
 })
 
-ipcMain.handle('save-file-as', async (event, content: string, expectedPath?: string) => {
+ipcMain.handle('save-file-as', async (event, content: string, expectedPath?: string, tabId?: number) => {
   const win = getWinFromEvent(event)
   if (!win) return null
-  const sourcePath = getState(win).filePath
+  const tab = getTab(win, tabId)
+  if (!tab) return null
+  const sourcePath = tab.filePath
   if (expectedPath && sourcePath !== expectedPath) return null
   const result = await dialog.showSaveDialog(win, {
     defaultPath: suggestSavePath(win, suggestFileName(win, content)),
@@ -774,7 +805,7 @@ ipcMain.handle('save-file-as', async (event, content: string, expectedPath?: str
     ]
   })
   if (result.canceled || !result.filePath) return null
-  const ok = await saveToPath(win, result.filePath, content, sourcePath, true)
+  const ok = await saveToPath(win, tab, result.filePath, content, sourcePath, true)
   return ok ? result.filePath : null
 })
 
@@ -791,7 +822,7 @@ ipcMain.handle('export-docx', async (event, content: unknown) => {
   if (result.canceled || !result.filePath) return false
   try {
     const { markdownToDocx } = await import('./docx-export')
-    await writeFile(result.filePath, await markdownToDocx({ content, sourcePath: getState(win).filePath }))
+    await writeFile(result.filePath, await markdownToDocx({ content, sourcePath: activeTabOf(getState(win))?.filePath ?? null }))
     shell.showItemInFolder(result.filePath)
     return true
   } catch (error) {
@@ -1077,15 +1108,17 @@ ipcMain.handle('set-editor-font', (_event, prefs: unknown) => {
 })
 
 // External edit collided with unsaved local changes. Pause the editor's
-// autosave (renderer side) and ask the user which version survives.
+// autosave (renderer side) and ask the user which version survives. Conflicts
+// only reach this dialog for the active tab; background tabs defer theirs
+// until they are activated again.
 ipcMain.handle('report-external-conflict', async (event) => {
   const win = getWinFromEvent(event)
   if (!win) {
     event.sender.send('external-conflict-result', { action: 'keep' })
     return
   }
-  const state = getState(win)
-  const filePath = state.filePath
+  const tab = activeTabOf(getState(win))
+  const filePath = tab?.filePath ?? null
   const choice = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['保留我的版本（继续编辑）', '加载磁盘上的版本（丢弃未保存的输入）'],
@@ -1095,10 +1128,10 @@ ipcMain.handle('report-external-conflict', async (event) => {
     detail: '你正在编辑的内容尚未保存，同时磁盘上的文件已被外部修改。请选择保留哪个版本。'
   })
   if (win.isDestroyed()) return
-  if (choice.response === 1 && filePath) {
+  if (choice.response === 1 && filePath && tab) {
     try {
       const data = await readFile(filePath, 'utf-8')
-      state.lastInternalSaveContent = data
+      tab.lastInternalSaveContent = data
       event.sender.send('external-conflict-result', { action: 'load', content: resolveImagePaths(data, filePath) })
       return
     } catch {
@@ -1194,6 +1227,55 @@ function sendToFocused(channel: string, ...args: unknown[]): void {
   if (win) win.webContents.send(channel, ...args)
 }
 
+// --- Tab lifecycle entry points (docs/tabs-tech-design.md D5) ---
+
+function newTabInWindow(win: BrowserWindow): void {
+  const tab = createTab(win)
+  win.webContents.send('new-tab', tab.tabId)
+}
+
+function newTabInFocusedWindow(): void {
+  const win = getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed())
+  if (win) newTabInWindow(win)
+}
+
+// Close the active tab; closing the last tab closes the window (macOS
+// convention). Unsaved content is confirmed per tab, exactly like window close.
+async function closeTabInWindow(win: BrowserWindow, tabId: number): Promise<void> {
+  const state = getState(win)
+  const tab = state.tabs.get(tabId)
+  if (!tab) return
+  if (state.tabs.size <= 1) {
+    // Last tab: closing it means closing the window; the close handler owns
+    // the confirmation flow.
+    win.close()
+    return
+  }
+  if (tab.dirty) {
+    const ok = await confirmAndSaveTab(win, tab)
+    if (!ok) return
+  }
+  const ordered = [...state.tabs.keys()].sort((a, b) => a - b)
+  const index = ordered.indexOf(tabId)
+  const remaining = ordered.filter((id) => id !== tabId)
+  const activateTabId = remaining.length > 0 ? remaining[Math.min(Math.max(index, 0), remaining.length - 1)] : null
+  stopWatching(tab)
+  if (tab.debounceTimer) clearTimeout(tab.debounceTimer)
+  state.tabs.delete(tabId)
+  if (state.activeTabId === tabId && activateTabId !== null) state.activeTabId = activateTabId
+  updateTitle(win)
+  if (!win.isDestroyed()) win.webContents.send('tab-closed', { closedTabId: tabId, activateTabId })
+}
+
+function closeTabInFocusedWindow(): void {
+  const win = getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed())
+  if (!win) return
+  const state = getState(win)
+  const active = activeTabOf(state)
+  if (!active) return
+  void closeTabInWindow(win, active.tabId)
+}
+
 function buildMenu(): void {
   const isMac = process.platform === 'darwin'
 
@@ -1222,7 +1304,8 @@ function buildMenu(): void {
   const labels = preferredCheatsheetLanguage === 'zh'
     ? {
         file: '文件', edit: '编辑', view: '视图', theme: '主题', help: '帮助',
-        newFile: '新建', open: '打开...', save: '保存', saveAs: '另存为...',
+        newFile: '新建', newTab: '新建标签页', open: '打开...', save: '保存', saveAs: '另存为...',
+        closeTab: '关闭标签页',
         recentOpen: '最近打开', restoreOnLaunch: '启动时打开上次文档', clearRecent: '清除最近记录',
         exportPDF: '导出 PDF...', exportHTML: '导出 HTML...', exportWord: '导出 Word...', exportImageDesktop: '导出图片（电脑阅读）...', exportImageMobile: '导出图片（手机阅读）...', find: '查找',
         setDefault: '设置为默认应用...',
@@ -1240,7 +1323,8 @@ function buildMenu(): void {
       }
     : {
         file: 'File', edit: 'Edit', view: 'View', theme: 'Theme', help: 'Help',
-        newFile: 'New', open: 'Open...', save: 'Save', saveAs: 'Save As...',
+        newFile: 'New', newTab: 'New Tab', open: 'Open...', save: 'Save', saveAs: 'Save As...',
+        closeTab: 'Close Tab',
         recentOpen: 'Open Recent', restoreOnLaunch: 'Reopen last document at launch', clearRecent: 'Clear Recent',
         exportPDF: 'Export PDF...', exportHTML: 'Export HTML...', exportWord: 'Export Word...', exportImageDesktop: 'Export Image (Desktop)...', exportImageMobile: 'Export Image (Mobile)...', find: 'Find',
         setDefault: 'Set as Default...',
@@ -1316,6 +1400,11 @@ function buildMenu(): void {
           click: () => createWindow()
         },
         {
+          label: labels.newTab,
+          accelerator: 'CmdOrCtrl+T',
+          click: () => newTabInFocusedWindow()
+        },
+        {
           label: labels.open,
           accelerator: 'CmdOrCtrl+O',
           click: () => sendToFocused('menu-open')
@@ -1384,7 +1473,11 @@ function buildMenu(): void {
           click: () => setAsDefaultApp()
         },
         { type: 'separator' },
-        isMac ? { label: labels.close, role: 'close' } : { label: labels.quit, role: 'quit' }
+        // ⌘W closes the active tab and only closes the window with the last
+        // tab (macOS convention, design.md); role:'close' would skip the
+        // per-tab confirmation.
+        { label: labels.closeTab, accelerator: 'CmdOrCtrl+W', click: () => closeTabInFocusedWindow() },
+        ...(isMac ? [] : [{ label: labels.quit, role: 'quit' as const }])
       ]
     },
     {
@@ -1621,9 +1714,9 @@ app.whenReady().then(() => {
 
 // --- Unsaved-changes guard (auto-save is the primary defense; this is the backstop) ---
 
-// Ask one specific renderer for an atomic dirty/content snapshot. A timeout is
-// a failed request, never a signal that the document is clean.
-function requestDocumentState(win: BrowserWindow): Promise<DocumentSnapshot | null> {
+// Ask one specific renderer for an atomic per-tab dirty/content snapshot.
+// A timeout is a failed request, never a signal that the document is clean.
+function requestDocumentState(win: BrowserWindow): Promise<TabDocState[] | null> {
   const requestId = `${win.webContents.id}:${++nextDocumentStateRequestId}`
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -1639,13 +1732,21 @@ function requestDocumentState(win: BrowserWindow): Promise<DocumentSnapshot | nu
 
 ipcMain.on('document-state-response', (event, requestId: unknown, snapshot: unknown) => {
   if (typeof requestId !== 'string' || !snapshot || typeof snapshot !== 'object') return
-  const { dirty, content } = snapshot as DocumentSnapshot
-  if (typeof dirty !== 'boolean' || typeof content !== 'string') return
+  const { tabs } = snapshot as { tabs?: unknown }
+  if (!Array.isArray(tabs)) return
+  const parsed: TabDocState[] = []
+  for (const entry of tabs) {
+    if (!entry || typeof entry !== 'object') continue
+    const { tabId, path, dirty, content } = entry as TabDocState
+    if (typeof tabId !== 'number' || (path !== null && typeof path !== 'string')) continue
+    if (typeof dirty !== 'boolean') continue
+    parsed.push({ tabId, path, dirty, content: typeof content === 'string' ? content : undefined })
+  }
   const pending = pendingDocumentStateRequests.get(requestId)
   if (!pending || pending.webContentsId !== event.sender.id) return
   pendingDocumentStateRequests.delete(requestId)
   clearTimeout(pending.timer)
-  pending.resolve({ dirty, content })
+  pending.resolve(parsed)
 })
 
 ipcMain.on('renderer-ready', (event) => {
@@ -1656,9 +1757,37 @@ ipcMain.on('renderer-ready', (event) => {
 })
 
 // Renderer reports its unsaved state as a fast path for quit coordination.
-ipcMain.on('set-dirty', (event, isDirty: boolean) => {
+ipcMain.on('set-dirty', (event, isDirty: boolean, tabId?: number) => {
   const win = BrowserWindow.fromWebContents(event.sender)
-  if (win) getState(win).dirty = !!isDirty
+  if (!win) return
+  const tab = getTab(win, tabId)
+  if (tab) tab.dirty = !!isDirty
+})
+
+// Renderer created the session for a tab the main process spun up; it reports
+// back which tab is now active so save routing and titles stay correct.
+ipcMain.on('active-tab-changed', (event, tabId: unknown) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  if (!win || typeof tabId !== 'number') return
+  const state = getState(win)
+  if (!state.tabs.has(tabId)) return
+  state.activeTabId = tabId
+  updateTitle(win)
+})
+
+// Main spins up a blank tab (⌘T or the titlebar plus button).
+ipcMain.handle('new-tab', (event) => {
+  const win = getWinFromEvent(event)
+  if (!win) return null
+  const tab = createTab(win)
+  win.webContents.send('new-tab', tab.tabId)
+  return tab.tabId
+})
+
+ipcMain.handle('close-tab', (event, tabId: unknown) => {
+  const win = getWinFromEvent(event)
+  if (!win || typeof tabId !== 'number') return
+  void closeTabInWindow(win, tabId)
 })
 
 // Concurrent close events for the same window must share one prompt and save.
@@ -1674,13 +1803,13 @@ function confirmWindowClose(win: BrowserWindow, state: WindowState): Promise<boo
 // Confirm before losing unsaved edits. Returns true only after a verified save
 // or an explicit discard; every failure leaves the window open and dirty.
 async function handleWindowClose(win: BrowserWindow, state: WindowState): Promise<boolean> {
-  if (!state.rendererReady && !state.dirty) return true
+  if (!state.rendererReady && !hasDirtyTabs(state)) return true
 
-  const snapshot = await requestDocumentState(win)
-  if (!snapshot) {
+  const tabsState = await requestDocumentState(win)
+  if (!tabsState) {
     // Renderer is unresponsive: it cannot report state or save anything, so
     // blocking forever would trap the user. Offer an explicit escape instead.
-    if (!state.dirty) return true
+    if (!hasDirtyTabs(state)) return true
     const { response } = await dialog.showMessageBox(win, {
       type: 'warning',
       buttons: ['仍要关闭', '取消'],
@@ -1691,11 +1820,30 @@ async function handleWindowClose(win: BrowserWindow, state: WindowState): Promis
     })
     return response === 0
   }
-  state.dirty = snapshot.dirty
-  if (!snapshot.dirty) return true
+  // The renderer's report is authoritative for dirtiness.
+  for (const entry of tabsState) {
+    const tab = state.tabs.get(entry.tabId)
+    if (tab) tab.dirty = entry.dirty
+  }
+  const dirtyTabs = [...state.tabs.values()].filter((tab) => tab.dirty)
+  for (const tab of dirtyTabs) {
+    const entry = tabsState.find((candidate) => candidate.tabId === tab.tabId)
+    const ok = await confirmAndSaveTab(win, tab, entry?.content ?? '')
+    if (!ok) return false
+  }
+  return true
+}
 
-  const detail = state.filePath
-    ? `“${basename(state.filePath)}” 有未保存的修改。`
+// Confirm one dirty tab before it goes away (window close or tab close or a
+// file loading over it). Returns true only after a verified save, an explicit
+// discard, or when the tab turned out to be clean.
+async function confirmAndSaveTab(win: BrowserWindow, tab: TabState, content?: string): Promise<boolean> {
+  if (content === undefined) {
+    const tabsState = await requestDocumentState(win)
+    content = tabsState?.find((entry) => entry.tabId === tab.tabId)?.content ?? ''
+  }
+  const detail = tab.filePath
+    ? `“${basename(tab.filePath)}” 有未保存的修改。`
     : '当前未命名文档有未保存的修改。'
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning',
@@ -1707,15 +1855,15 @@ async function handleWindowClose(win: BrowserWindow, state: WindowState): Promis
   })
   if (response === 2) return false
   if (response === 1) {
-    state.dirty = false
+    tab.dirty = false
     return true
   }
 
-  const sourcePath = state.filePath
+  const sourcePath = tab.filePath
   let filePath = sourcePath
   if (!filePath) {
     const saveAs = await dialog.showSaveDialog(win, {
-      defaultPath: suggestSavePath(win, suggestFileName(win, snapshot.content)),
+      defaultPath: suggestSavePath(win, suggestFileName(win, content)),
       filters: [
         { name: 'Markdown', extensions: ['md'] },
         { name: 'All Files', extensions: ['*'] }
@@ -1725,7 +1873,7 @@ async function handleWindowClose(win: BrowserWindow, state: WindowState): Promis
     filePath = saveAs.filePath
   }
 
-  const saved = await saveToPath(win, filePath, snapshot.content, sourcePath, true)
+  const saved = await saveToPath(win, tab, filePath, content, sourcePath, true)
   if (!saved) {
     await dialog.showMessageBox(win, {
       type: 'error',
@@ -1735,7 +1883,7 @@ async function handleWindowClose(win: BrowserWindow, state: WindowState): Promis
     })
     return false
   }
-  state.dirty = false
+  tab.dirty = false
   return true
 }
 

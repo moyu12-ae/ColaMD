@@ -1,4 +1,5 @@
-import { createEditor, flashHeadingOnArrival, getMarkdown, onEditorJumpPhase, setMarkdown, showMathModal, setMathModalLanguage, releaseMermaidRenderer } from './editor/editor'
+import { createEditor, flashHeadingOnArrival, getMarkdown, onEditorJumpPhase, setMarkdown, showMathModal, setMathModalLanguage, releaseMermaidRenderer, captureEditorState, restoreEditorState, buildEditorState, serializeEditorState } from './editor/editor'
+import type { EditorState } from '@milkdown/kit/prose/state'
 import { SearchPanel } from './editor/search-panel'
 import { applyTheme, loadSavedTheme } from './themes/theme-manager'
 import { setUiLanguage, isChinese, type UiLanguage } from './ui-language'
@@ -23,6 +24,9 @@ const saveStatusEl = () => document.getElementById('save-status') as HTMLElement
 const updateBannerEl = () => document.getElementById('update-banner') as HTMLElement
 const updateBannerTextEl = () => document.getElementById('update-banner-text') as HTMLElement
 const updateBannerActionEl = () => document.getElementById('update-banner-action') as HTMLButtonElement
+const tabBarEl = () => document.getElementById('tab-bar') as HTMLElement
+const tabListEl = () => document.getElementById('tab-list') as HTMLElement
+const newTabBtnEl = () => document.getElementById('new-tab-btn') as HTMLButtonElement
 
 // --- Same-directory file panel ---
 let currentFilePath: string | null = null
@@ -88,7 +92,7 @@ let documentRevision = 0
 let saveQueue: Promise<void> = Promise.resolve()
 
 function reportDirty(): void {
-  window.electronAPI.reportDirty(dirty)
+  window.electronAPI.reportDirty(dirty, activeTabId >= 0 ? activeTabId : undefined)
 }
 
 // --- Save status hint (#49) ---
@@ -96,6 +100,188 @@ let saveStatusTimer: ReturnType<typeof setTimeout> | null = null
 // True while an external-modification conflict waits for the user's choice;
 // autosave stays paused so it cannot silently overwrite the external edit.
 let externalConflictPending = false
+
+// --- Tabs (docs/tabs-tech-design.md) ---
+// The editor is a single instance. The module-level variables above are the
+// live state of the ACTIVE tab; each background tab keeps a snapshot and the
+// switch protocol swaps the two sides. Snapshots hold whole EditorStates, so
+// undo history, selection, and search state travel with their tab and can
+// never reach into another tab's document.
+interface TabSession {
+  tabId: number
+  filePath: string | null
+  dirty: boolean
+  documentRevision: number
+  sourceModeActive: boolean
+  editorState: EditorState | null
+  sourceContent: string | null
+  scrollRatioValue: number
+  externalConflictPending: boolean
+  // Disk version that arrived while this tab was in the background; the
+  // conflict dialog is deferred until the tab becomes active again.
+  externalDiskContent: string | null
+  // Content loaded from main that has not been applied to any editor state
+  // yet (tab created by main, or a background hot reload of a clean tab).
+  pendingLoad: string | null
+  outlineActiveIndex: number
+}
+
+const tabs = new Map<number, TabSession>()
+let activeTabId = -1
+
+function tabName(filePath: string | null): string {
+  return filePath ? (filePath.split(/[\\/]/).pop() || filePath) : (isChinese() ? '未命名' : 'Untitled')
+}
+
+function createLocalSession(tabId: number): TabSession {
+  const session: TabSession = {
+    tabId,
+    filePath: null,
+    dirty: false,
+    documentRevision: 0,
+    sourceModeActive: false,
+    editorState: null,
+    sourceContent: null,
+    scrollRatioValue: 0,
+    externalConflictPending: false,
+    externalDiskContent: null,
+    pendingLoad: null,
+    outlineActiveIndex: -1,
+  }
+  tabs.set(tabId, session)
+  return session
+}
+
+// Copy the live variables into the outgoing tab's snapshot before the live
+// state is overwritten by the incoming tab.
+function captureActiveSession(): void {
+  const snap = tabs.get(activeTabId)
+  if (!snap) return
+  snap.filePath = currentFilePath
+  snap.dirty = dirty
+  snap.documentRevision = documentRevision
+  snap.externalConflictPending = externalConflictPending
+  snap.sourceModeActive = sourceModeActive
+  snap.outlineActiveIndex = outlineActiveIndex
+  if (sourceModeActive) {
+    snap.sourceContent = sourceEl().value
+    snap.scrollRatioValue = scrollRatio(sourceEl())
+    snap.editorState = null
+  } else {
+    snap.editorState = captureEditorState()
+    snap.scrollRatioValue = scrollRatio(editorEl())
+    snap.sourceContent = null
+  }
+}
+
+function surfaceDeferredConflict(): void {
+  const snap = tabs.get(activeTabId)
+  if (!snap || !snap.externalConflictPending || snap.externalDiskContent === null) return
+  const el = saveStatusEl()
+  if (el) {
+    el.textContent = isChinese() ? '文件已被外部修改' : 'File changed externally'
+    el.classList.remove('saved')
+    el.classList.add('pending')
+  }
+  window.electronAPI.reportExternalConflict?.()
+}
+
+function activateSession(tabId: number): void {
+  const snap = tabs.get(tabId)
+  if (!snap || tabId === activeTabId) return
+  // Flush the outgoing tab's pending autosave while its content is still in
+  // the live editor; runAutosave captures path and content synchronously.
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer)
+    autosaveTimer = null
+    if (dirty && currentFilePath && !externalConflictPending) void runAutosave()
+  }
+  captureActiveSession()
+  activeTabId = tabId
+  currentFilePath = snap.filePath
+  dirty = snap.dirty
+  // Invalidate saves that were in flight for either tab across the switch.
+  documentRevision = snap.documentRevision + 1
+  snap.documentRevision = documentRevision
+  externalConflictPending = snap.externalConflictPending
+  if (snap.sourceModeActive) {
+    enterSourceMode(snap.sourceContent ?? '', snap.scrollRatioValue)
+  } else if (snap.editorState) {
+    exitSourceMode()
+    restoreEditorState(snap.editorState)
+    restoreScrollRatio(editorEl(), snap.scrollRatioValue)
+  } else if (snap.pendingLoad !== null) {
+    setContent(snap.pendingLoad, true)
+    snap.pendingLoad = null
+    editorEl().scrollTop = 0
+    sourceEl().scrollTop = 0
+  } else {
+    // A blank tab created by New Tab.
+    setContent('', true)
+    editorEl().scrollTop = 0
+    sourceEl().scrollTop = 0
+  }
+  snap.editorState = null
+  snap.sourceContent = null
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer)
+    autosaveTimer = null
+  }
+  if (dirty && currentFilePath && !externalConflictPending) scheduleAutosave()
+  window.electronAPI.reportDirty(dirty, tabId)
+  updateFileTitle()
+  updateFileRevealButton()
+  updateSourceToggle()
+  updateWordCount()
+  if (dirty) {
+    showSaveStatus('dirty')
+  } else {
+    clearSaveStatus()
+  }
+  endOutlineJump()
+  outlineActiveIndex = snap.outlineActiveIndex
+  scheduleOutlineUpdate()
+  surfaceDeferredConflict()
+  void window.electronAPI.notifyActiveTab(tabId)
+  renderTabStrip()
+  updateTabBarVisibility()
+}
+
+function removeLocalSession(tabId: number): void {
+  tabs.delete(tabId)
+}
+
+function renderTabStrip(): void {
+  const list = tabListEl()
+  if (!list) return
+  list.innerHTML = ''
+  const ordered = [...tabs.values()].sort((a, b) => a.tabId - b.tabId)
+  for (const snap of ordered) {
+    const item = document.createElement('div')
+    item.className = 'tab-item' + (snap.tabId === activeTabId ? ' active' : '')
+    const name = tabName(snap.filePath)
+    const label = document.createElement('span')
+    label.className = 'tab-name'
+    label.textContent = name
+    item.title = snap.filePath ?? name
+    item.dataset.tabId = String(snap.tabId)
+    item.addEventListener('click', () => activateSession(snap.tabId))
+    item.addEventListener('auxclick', (e) => {
+      if (e.button === 1) void window.electronAPI.closeTab(snap.tabId)
+    })
+    item.append(label)
+    list.appendChild(item)
+  }
+}
+
+// design.md: the tab bar only exists once the user has created a second tab;
+// with fewer than two tabs there is no persistent region at all.
+function updateTabBarVisibility(): void {
+  const visible = tabs.size >= 2
+  const bar = tabBarEl()
+  if (bar) bar.hidden = !visible
+  document.body.classList.toggle('has-tabs', visible)
+}
 
 function showSaveStatus(state: 'dirty' | 'saved'): void {
   const el = saveStatusEl()
@@ -179,7 +365,7 @@ async function runAutosave(): Promise<void> {
   // rebuildMenu=false: autosave must never rebuild the app menu (macOS IME)
   // autosave=true: the main process may refuse the write when the file changed
   // on disk since our last read or write, and ask the user instead.
-  const path = await enqueueSave(() => window.electronAPI.saveFile(content, filePath, false, true))
+  const path = await enqueueSave(() => window.electronAPI.saveFile(content, filePath, false, true, activeTabId >= 0 ? activeTabId : undefined))
   if (path && revision === documentRevision && currentFilePath === filePath) {
     currentFilePath = path
     clearDirty()
@@ -191,9 +377,10 @@ async function saveCurrent(saveAs = false): Promise<boolean> {
   const revision = documentRevision
   const content = getContent()
   const expectedPath = currentFilePath
+  const tabId = activeTabId
   const path = await enqueueSave(() => saveAs
-    ? window.electronAPI.saveFileAs(content, expectedPath ?? undefined)
-    : window.electronAPI.saveFile(content, expectedPath ?? undefined, true))
+    ? window.electronAPI.saveFileAs(content, expectedPath ?? undefined, tabId >= 0 ? tabId : undefined)
+    : window.electronAPI.saveFile(content, expectedPath ?? undefined, true, false, tabId >= 0 ? tabId : undefined))
   if (!path || currentFilePath !== expectedPath) return false
 
   currentFilePath = path
@@ -784,9 +971,22 @@ async function init(): Promise<void> {
   editorReady = true
   resetDirty()
 
-  // Main asks for an authoritative snapshot before any close or quit.
+  // Main asks for an authoritative snapshot before any close or quit. Every
+  // tab reports its own state; dirty tabs include their content so the main
+  // process can save them without another round trip.
   api.onRequestDocumentState((requestId) => {
-    window.electronAPI.respondDocumentState(requestId, { dirty, content: getContent() })
+    const tabStates = [...tabs.values()].map((snap) => {
+      const isActive = snap.tabId === activeTabId
+      const isDirty = isActive ? dirty : snap.dirty
+      let content: string | undefined
+      if (isDirty) {
+      content = isActive
+        ? getContent()
+        : (snap.sourceContent ?? (snap.editorState ? serializeEditorState(snap.editorState) : null) ?? '')
+      }
+      return { tabId: snap.tabId, path: snap.filePath, dirty: isDirty, content }
+    })
+    window.electronAPI.respondDocumentState(requestId, { tabs: tabStates })
   })
   api.reportRendererReady()
 
@@ -839,6 +1039,7 @@ async function init(): Promise<void> {
 
   api.onSiblingsChanged((files) => renderFileList(files))
   updatePanelVisibility()
+  updateTabBarVisibility()
   await refreshSiblings()
 
   api.onMenuOpen(async () => {
@@ -855,6 +1056,20 @@ async function init(): Promise<void> {
 
   api.onNewFile(() => { releaseMermaidRenderer(); exitSourceMode(); applyContent(''); scheduleOutlineUpdate() })
   api.onFileOpened((data) => {
+    if (!tabs.has(data.tabId)) createLocalSession(data.tabId)
+    if (data.tabId !== activeTabId) {
+      // Background load: park the content in the session; activation applies it.
+      const snap = tabs.get(data.tabId)!
+      snap.filePath = data.path
+      snap.pendingLoad = data.content
+      snap.dirty = false
+      snap.documentRevision += 1
+      snap.externalConflictPending = false
+      snap.externalDiskContent = null
+      renderTabStrip()
+      return
+    }
+    tabs.get(data.tabId)!.filePath = data.path
     releaseMermaidRenderer()
     currentFilePath = data.path
     updateFileRevealButton()
@@ -870,8 +1085,23 @@ async function init(): Promise<void> {
     updatePanelVisibility()
     refreshSiblings()
     scheduleOutlineUpdate()
+    renderTabStrip()
   })
-  api.onFileChanged((content) => {
+  api.onFileChanged((data) => {
+    if (data.tabId !== activeTabId) {
+      const snap = tabs.get(data.tabId)
+      if (!snap) return
+      if (snap.dirty) {
+        // A background tab must never be clobbered by an external write; the
+        // conflict decision is deferred until the tab becomes active again.
+        snap.externalConflictPending = true
+        snap.externalDiskContent = data.content
+      } else {
+        snap.pendingLoad = data.content
+        snap.documentRevision += 1
+      }
+      return
+    }
     // An external edit landing while the user still has unsaved changes must
     // never clobber the editor, and plain autosave would silently overwrite
     // the external edit. Pause autosave and let the user choose explicitly.
@@ -896,17 +1126,33 @@ async function init(): Promise<void> {
       return
     }
     if (sourceModeActive) {
-      sourceEl().value = content
+      sourceEl().value = data.content
     } else {
       // An external write is not something the reader can undo into; making it
       // one undo step would also let a stray undo write stale content back.
-      setMarkdownProgrammatically(content, true)
+      setMarkdownProgrammatically(data.content, true)
     }
     updateSourceToggle()
     updateWordCount()
     resetDirty()
     scheduleOutlineUpdate()
   })
+
+  // --- Tab lifecycle, driven by the main process (docs/tabs-tech-design.md) ---
+  api.onNewTab((tabId) => {
+    createLocalSession(tabId)
+    activateSession(tabId)
+  })
+  api.onTabClosed(({ closedTabId, activateTabId }) => {
+    removeLocalSession(closedTabId)
+    if (activateTabId !== null && tabs.has(activateTabId) && activateTabId !== activeTabId) {
+      activateSession(activateTabId)
+    }
+    renderTabStrip()
+    updateTabBarVisibility()
+  })
+  api.onActivateTab((tabId) => activateSession(tabId))
+  newTabBtnEl().addEventListener('click', () => { void api.newTab() })
 
   api.onSetTheme((theme) => applyTheme(theme))
   api.onLanguageChanged((language: UiLanguage) => {
@@ -921,6 +1167,11 @@ async function init(): Promise<void> {
       resetDirty()
       updateWordCount()
       scheduleOutlineUpdate()
+      const snap = tabs.get(activeTabId)
+      if (snap) {
+        snap.externalDiskContent = null
+        snap.pendingLoad = null
+      }
     } else {
       // Keep mine: resume autosave; the next save overwrites the external edit.
       showSaveStatus('dirty')

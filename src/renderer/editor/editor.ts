@@ -1,5 +1,5 @@
-import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx, remarkPluginsCtx, remarkStringifyOptionsCtx } from '@milkdown/kit/core'
-import { Plugin, PluginKey } from '@milkdown/kit/prose/state'
+import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx, parserCtx, remarkPluginsCtx, remarkStringifyOptionsCtx } from '@milkdown/kit/core'
+import { Plugin, PluginKey, EditorState } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet, type EditorView } from '@milkdown/kit/prose/view'
 import remarkBreaks from 'remark-breaks'
 import { commonmark } from '@milkdown/kit/preset/commonmark'
@@ -613,4 +613,49 @@ export function getEditorView(): EditorView | null {
     view = ctx.get(editorViewCtx)
   })
   return view
+}
+
+// --- Tab switching primitives (docs/tabs-tech-design.md D2) ---
+// The editor stays a single instance; each tab carries its own full
+// EditorState (document, selection, undo history, search decorations).
+// Switching captures and restores whole states, so tabs can never reach into
+// each other's undo stacks.
+
+export function captureEditorState(): EditorState | null {
+  const view = getEditorView()
+  return view ? view.state : null
+}
+
+export function restoreEditorState(state: EditorState): void {
+  const view = getEditorView()
+  if (!view) return
+  view.updateState(state)
+}
+
+// Build a fresh state from markdown without touching the live view. Used when
+// a background tab's file changes on disk: the tab's saved state is replaced
+// by a newly parsed document whose history starts empty, mirroring what the
+// active-tab hot reload does with flushHistory=true.
+export function buildEditorState(markdown: string): EditorState | null {
+  if (!editorInstance) return null
+  let built: EditorState | null = null
+  editorInstance.action((ctx) => {
+    const parser = ctx.get(parserCtx)
+    const view = ctx.get(editorViewCtx)
+    const doc = parser(markdown)
+    built = EditorState.create({ schema: view.state.schema, plugins: view.state.plugins, doc })
+  })
+  return built
+}
+
+// Serialize a captured state without making it live. Used when the main
+// process collects dirty tabs for the close confirmation.
+export function serializeEditorState(state: EditorState): string | null {
+  if (!editorInstance) return null
+  let markdown: string | null = null
+  editorInstance.action((ctx) => {
+    const serializer = ctx.get(serializerCtx)
+    markdown = serializer(state.doc)
+  })
+  return markdown
 }
