@@ -134,6 +134,10 @@ function tabName(filePath: string | null): string {
 }
 
 function createLocalSession(tabId: number): TabSession {
+  // Events can arrive out of order at startup (file-opened queues before
+  // new-tab is registered), so creating twice must preserve parked state.
+  const existing = tabs.get(tabId)
+  if (existing) return existing
   const session: TabSession = {
     tabId,
     filePath: null,
@@ -249,6 +253,30 @@ function activateSession(tabId: number): void {
 
 function removeLocalSession(tabId: number): void {
   tabs.delete(tabId)
+}
+
+// Apply a freshly loaded document to the ACTIVE tab. Shared by the
+// file-opened event and the startup path where file-opened is processed
+// before new-tab (both queues flush at registration time).
+function applyLoadedContent(path: string | null, content: string): void {
+  releaseMermaidRenderer()
+  currentFilePath = path
+  const snap = tabs.get(activeTabId)
+  if (snap) snap.filePath = path
+  updateFileRevealButton()
+  resetDirty()
+  setContent(content, true)
+  const resetScroll = () => {
+    editorEl().scrollTop = 0
+    sourceEl().scrollTop = 0
+  }
+  resetScroll()
+  requestAnimationFrame(resetScroll)
+  updateFileTitle()
+  updatePanelVisibility()
+  refreshSiblings()
+  scheduleOutlineUpdate()
+  renderTabStrip()
 }
 
 function renderTabStrip(): void {
@@ -1056,10 +1084,9 @@ async function init(): Promise<void> {
 
   api.onNewFile(() => { releaseMermaidRenderer(); exitSourceMode(); applyContent(''); scheduleOutlineUpdate() })
   api.onFileOpened((data) => {
-    if (!tabs.has(data.tabId)) createLocalSession(data.tabId)
+    const snap = createLocalSession(data.tabId)
     if (data.tabId !== activeTabId) {
       // Background load: park the content in the session; activation applies it.
-      const snap = tabs.get(data.tabId)!
       snap.filePath = data.path
       snap.pendingLoad = data.content
       snap.dirty = false
@@ -1069,23 +1096,7 @@ async function init(): Promise<void> {
       renderTabStrip()
       return
     }
-    tabs.get(data.tabId)!.filePath = data.path
-    releaseMermaidRenderer()
-    currentFilePath = data.path
-    updateFileRevealButton()
-    resetDirty()
-    setContent(data.content, true)
-    const resetScroll = () => {
-      editorEl().scrollTop = 0
-      sourceEl().scrollTop = 0
-    }
-    resetScroll()
-    requestAnimationFrame(resetScroll)
-    updateFileTitle()
-    updatePanelVisibility()
-    refreshSiblings()
-    scheduleOutlineUpdate()
-    renderTabStrip()
+    applyLoadedContent(data.path, data.content)
   })
   api.onFileChanged((data) => {
     if (data.tabId !== activeTabId) {
@@ -1140,7 +1151,21 @@ async function init(): Promise<void> {
 
   // --- Tab lifecycle, driven by the main process (docs/tabs-tech-design.md) ---
   api.onNewTab((tabId) => {
-    createLocalSession(tabId)
+    const snap = createLocalSession(tabId)
+    if (activeTabId === -1) {
+      // First tab of the window: the editor already shows its startup content.
+      // file-opened may have arrived first (its queue flushes earlier) and
+      // parked content here; apply it now.
+      activeTabId = tabId
+      if (snap.pendingLoad !== null) {
+        const content = snap.pendingLoad
+        snap.pendingLoad = null
+        applyLoadedContent(snap.filePath, content)
+      }
+      renderTabStrip()
+      updateTabBarVisibility()
+      return
+    }
     activateSession(tabId)
   })
   api.onTabClosed(({ closedTabId, activateTabId }) => {
