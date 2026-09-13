@@ -278,7 +278,10 @@ body.has-tabs {
   display: flex;
   align-items: stretch;
   padding: 0 8px;
-  background: var(--code-block-bg);
+  /* A surface a few percent off the body background, derived from semantic
+     tokens: --code-block-bg is a dark slate in several light themes (elegant,
+     sepia) and would paint a black bar (design.md: subtle light/dark offset). */
+  background: color-mix(in srgb, var(--bg-color) 94%, var(--text-color));
   border-bottom: 1px solid var(--border-color);
   -webkit-app-region: drag;
 }
